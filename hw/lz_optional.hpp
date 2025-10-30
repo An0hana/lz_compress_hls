@@ -557,90 +557,88 @@ void lzBooster(hls::stream<IntVectorStream_dt<32, 1> >& inStream, hls::stream<In
 template <int MAX_MATCH_LEN, int BOOSTER_OFFSET_WINDOW = 16 * 1024, int LEFT_BYTES = 64>
 void lzBooster(hls::stream<compressd_dt>& inStream, hls::stream<compressd_dt>& outStream, uint32_t input_size) {
     if (input_size == 0) return;
+
     uint8_t local_mem[BOOSTER_OFFSET_WINDOW];
 #pragma HLS BIND_STORAGE variable=local_mem type=RAM_T2P impl=BRAM
 
-    uint32_t match_loc = 0;
-    uint32_t match_len = 0;
+    // Pipelined state registers to break dependency chains
+    uint32_t match_loc_reg = 0;
+    uint32_t match_len_reg = 0;
+    bool match_flag_reg = false;
+    uint16_t skip_len_reg = 0;
+    
+    compressd_dt val_in_flight; // Holds the value being processed
 
-    compressd_dt outValuePrev; // Use a separate register for the previous output
-    compressd_dt outValueCurr; // Use a register for the current value being processed
-
-    bool matchFlag = false;
-    uint16_t skip_len = 0;
-
-lz_booster_init:
-    // This small loop can be left as is, it's not part of the main pipeline bottleneck.
-    for (uint32_t i = 0; i < (input_size > 0 ? 1 : 0) ; ++i) {
-        outValueCurr = inStream.read();
+    // Prime the pipeline by reading the first value. This handles edge cases for small files.
+    if (input_size > 0) {
+        val_in_flight = inStream.read();
     }
 
-
 lz_booster:
-    for (uint32_t i = 1; i < (input_size - LEFT_BYTES); i++) {
+    // Loop until one before the main leftover part
+    for (uint32_t i = 1; i < (input_size > LEFT_BYTES ? input_size - LEFT_BYTES : 1); i++) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS dependence variable = local_mem inter false
-        
-        compressd_dt inValue = inStream.read();
-        
-        uint8_t tCh = outValueCurr.range(7, 0);
-        uint8_t tLen = outValueCurr.range(15, 8);
-        uint16_t tOffset = outValueCurr.range(31, 16);
-        
-        local_mem[ (i-1) % BOOSTER_OFFSET_WINDOW] = tCh;
 
-        outValuePrev = outValueCurr;
-        outValueCurr = inValue;
+        compressd_dt val_from_stream = inStream.read();
         
-        bool current_match_possible = (tOffset < BOOSTER_OFFSET_WINDOW) && (tLen > 0);
-        uint8_t nextMatchCh = local_mem[match_loc % BOOSTER_OFFSET_WINDOW];
+        uint8_t tCh = val_in_flight.range(7, 0);
+        uint8_t tLen = val_in_flight.range(15, 8);
+        uint16_t tOffset = val_in_flight.range(31, 16);
         
-        // This logic is restructured to break dependencies
-        if (skip_len > 0) {
-            skip_len--;
-            matchFlag = false; // A skipped character cannot extend a match
-        } else if (matchFlag && (match_len < MAX_MATCH_LEN) && (tCh == nextMatchCh)) {
-            match_len++;
-            match_loc++;
+        // Write to memory in the current cycle. This can happen in parallel.
+        local_mem[(i - 1) % BOOSTER_OFFSET_WINDOW] = tCh;
+
+        // Read from memory for the *next* cycle's calculation. This breaks read-after-write hazards.
+        uint8_t nextMatchCh = local_mem[match_loc_reg % BOOSTER_OFFSET_WINDOW];
+        
+        // All logic below is explicitly structured to be pipelinable
+        if (skip_len_reg > 0) {
+            skip_len_reg--;
+            match_flag_reg = false;
+        } else if (match_flag_reg && (match_len_reg < MAX_MATCH_LEN) && (tCh == nextMatchCh)) {
+            match_len_reg++;
+            match_loc_reg++;
         } else {
-            // This block is entered when a new decision is made
+            bool current_match_possible = (tOffset < BOOSTER_OFFSET_WINDOW) && (tLen > 0);
             if (current_match_possible) {
-                matchFlag = true;
-                match_len = 1;
-                match_loc = (i-1) - tOffset;
+                match_flag_reg = true;
+                match_len_reg = tLen; // Start with the length provided by lz_compress
+                match_loc_reg = (i - 1) - tOffset + tLen;
             } else {
-                matchFlag = false;
-                match_len = 0; // No match
-                if(tLen > 0) {
-                   skip_len = tLen -1;
+                match_flag_reg = false;
+                if (tLen > 0) {
+                   skip_len_reg = tLen - 1;
                 } else {
-                   skip_len = 0;
+                   skip_len_reg = 0;
                 }
             }
         }
         
-        // Update the outgoing value based on the *previous* state
-        compressd_dt outStreamValue = outValuePrev;
-        if(matchFlag && skip_len == 0){ // Update length only if it's a valid, ongoing match
-            uint8_t prev_tLen = outValuePrev.range(15,8);
-            if(prev_tLen > 0){
-               outStreamValue.range(15, 8) = match_len;
-            }
+        // The output value is always the one that started this iteration
+        compressd_dt outStreamValue = val_in_flight;
+        // The length is updated based on the *ongoing* match decision
+        if (match_flag_reg) {
+            outStreamValue.range(15, 8) = match_len_reg;
         }
         
         outStream << outStreamValue;
+        
+        // The value from the stream becomes the value in flight for the next iteration
+        val_in_flight = val_from_stream;
     }
 
-    // Drain the last few values
-    // This part is not performance-critical
-    if (input_size > 1) {
-        outStream << outValueCurr;
+    // Drain the last few values that are not part of the main loop
+    if (input_size > LEFT_BYTES) {
+        outStream << val_in_flight;
     }
+
 lz_booster_left_bytes:
     for (uint32_t i = 0; i < LEFT_BYTES; i++) {
-#pragma HLS PIPELINE II=1
-       if (i < (input_size > (1+i) ? (input_size-(1+i)) : 0))
-        outStream << inStream.read();
+#pragma HLS PIPELINE
+        // This loop handles the final bytes and is not on the critical performance path
+        if (i < (input_size > LEFT_BYTES ? LEFT_BYTES : input_size) - (input_size > 0 ? 1 : 0) )
+             outStream << inStream.read();
     }
 }
 
