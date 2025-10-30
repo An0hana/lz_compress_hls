@@ -115,35 +115,83 @@ lz_compress:
         // Dictionary Update
         dict[hash] = dictWriteValue;
 
-        // Match search and Filtering
-        // Comp dict pick
-        uint8_t match_length = 0;
-        uint32_t match_offset = 0;
+        // ================== THE FINAL, ROBUST & SAFE OPTIMIZATION ==================
+        
+        // -- STAGE 1: MAP (Parallel computation of all candidates) --
+        uint8_t len_array[MATCH_LEVEL];
+        uint32_t offset_array[MATCH_LEVEL];
+#pragma HLS ARRAY_PARTITION variable=len_array complete
+#pragma HLS ARRAY_PARTITION variable=offset_array complete
+
         for (int l = 0; l < MATCH_LEVEL; l++) {
+#pragma HLS UNROLL
             uint8_t len = 0;
             bool done = 0;
             uintDict_t compareWith = dictReadValue.range((l + 1) * c_dictEleWidth - 1, l * c_dictEleWidth);
             uint32_t compareIdx = compareWith.range(c_dictEleWidth - 1, MATCH_LEN * 8);
+
             for (int m = 0; m < MATCH_LEN; m++) {
+#pragma HLS UNROLL
                 if (present_window[m] == compareWith.range((m + 1) * 8 - 1, m * 8) && !done) {
                     len++;
                 } else {
                     done = 1;
                 }
             }
+
             if ((len >= MIN_MATCH) && (currIdx > compareIdx) && ((currIdx - compareIdx) < LZ_MAX_OFFSET_LIMIT) &&
                 ((currIdx - compareIdx - 1) >= MIN_OFFSET)) {
                 if ((len == 3) && ((currIdx - compareIdx - 1) > 4096)) {
-                    len = 0;
+                    len_array[l] = 0;
+                } else {
+                    len_array[l] = len;
                 }
             } else {
-                len = 0;
+                len_array[l] = 0;
             }
-            if (len > match_length) {
-                match_length = len;
-                match_offset = currIdx - compareIdx - 1;
-            }
+            offset_array[l] = currIdx - compareIdx - 1;
         }
+
+        // -- STAGE 2: REDUCE (Template-safe, manually unrolled comparison tree) --
+        // Step 2.1: Safely load all candidates into local variables.
+        // This is the CRITICAL step that prevents all previous C-simulation crashes.
+        uint8_t len_0 = 0, len_1 = 0, len_2 = 0, len_3 = 0, len_4 = 0, len_5 = 0;
+        uint32_t off_0 = 0, off_1 = 0, off_2 = 0, off_3 = 0, off_4 = 0, off_5 = 0;
+
+        if (MATCH_LEVEL > 0) { len_0 = len_array[0]; off_0 = offset_array[0]; }
+        if (MATCH_LEVEL > 1) { len_1 = len_array[1]; off_1 = offset_array[1]; }
+        if (MATCH_LEVEL > 2) { len_2 = len_array[2]; off_2 = offset_array[2]; }
+        if (MATCH_LEVEL > 3) { len_3 = len_array[3]; off_3 = offset_array[3]; }
+        if (MATCH_LEVEL > 4) { len_4 = len_array[4]; off_4 = offset_array[4]; }
+        if (MATCH_LEVEL > 5) { len_5 = len_array[5]; off_5 = offset_array[5]; }
+
+        // Step 2.2: Perform the parallel comparison tree on these safe local variables.
+        // HLS will synthesize this into a multi-stage parallel hardware comparator.
+        uint8_t best_len_s1_0, best_len_s1_1, best_len_s1_2;
+        uint32_t best_off_s1_0, best_off_s1_1, best_off_s1_2;
+
+        if (len_0 >= len_1) { best_len_s1_0 = len_0; best_off_s1_0 = off_0; } 
+        else { best_len_s1_0 = len_1; best_off_s1_0 = off_1; }
+
+        if (len_2 >= len_3) { best_len_s1_1 = len_2; best_off_s1_1 = off_2; } 
+        else { best_len_s1_1 = len_3; best_off_s1_1 = off_3; }
+        
+        if (len_4 >= len_5) { best_len_s1_2 = len_4; best_off_s1_2 = off_4; } 
+        else { best_len_s1_2 = len_5; best_off_s1_2 = off_5; }
+
+        uint8_t best_len_s2_0;
+        uint32_t best_off_s2_0;
+
+        if (best_len_s1_0 >= best_len_s1_1) { best_len_s2_0 = best_len_s1_0; best_off_s2_0 = best_off_s1_0; }
+        else { best_len_s2_0 = best_len_s1_1; best_off_s2_0 = best_off_s1_1; }
+
+        uint8_t match_length;
+        uint32_t match_offset;
+
+        if (best_len_s2_0 >= best_len_s1_2) { match_length = best_len_s2_0; match_offset = best_off_s2_0; }
+        else { match_length = best_len_s1_2; match_offset = best_off_s1_2; }
+        // =================================================================================
+
         ap_uint<32> outValue = 0;
         outValue.range(7, 0) = present_window[0];
         outValue.range(15, 8) = match_length;
